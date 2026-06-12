@@ -26,6 +26,8 @@ let authReady = false;
 let activitiesReady = false;
 let liveRoomCache = null;
 let liveSyncHandle = null;
+let sessionHistory = [];
+let historyReady = false;
 const LIVE_CODE_KEY = "pulseplay-live-code";
 const clientId = sessionStorage.getItem(CLIENT_KEY) || crypto.randomUUID();
 sessionStorage.setItem(CLIENT_KEY, clientId);
@@ -49,6 +51,12 @@ function getAdmin() {
   return getUsers().find(user => user.id === id) || null;
 }
 
+function authRedirect(path = "") {
+  const configured = window.PULSEPLAY_CONFIG?.publicAppUrl || `${location.origin}${location.pathname}`;
+  const base = configured.endsWith("/") ? configured : `${configured}/`;
+  return `${base}${path.replace(/^\//, "")}`;
+}
+
 async function loadSupabaseAdmin(user) {
   if (!user || !window.pulseplaySupabase) {
     supabaseAdmin = null;
@@ -70,7 +78,36 @@ async function loadSupabaseAdmin(user) {
     createdAt: profile?.created_at ? new Date(profile.created_at).getTime() : Date.now(),
     provider: user.app_metadata?.provider || "email",
   };
-  await loadSupabaseActivities();
+  await Promise.all([loadSupabaseActivities(), loadSessionHistory()]);
+}
+
+async function loadSessionHistory() {
+  if (!window.pulseplaySupabase || !supabaseAdmin?.workspaceId) return;
+  const { data: sessions, error: sessionsError } = await window.pulseplaySupabase
+    .from("live_sessions")
+    .select("id, activity_id, code, status, created_at, started_at, ended_at")
+    .eq("workspace_id", supabaseAdmin.workspaceId)
+    .order("created_at", { ascending: false });
+  if (sessionsError) throw sessionsError;
+
+  const sessionIds = (sessions || []).map(session => session.id);
+  const activityIds = [...new Set((sessions || []).map(session => session.activity_id).filter(Boolean))];
+  const [participantsResult, responsesResult, questionsResult] = await Promise.all([
+    sessionIds.length ? window.pulseplaySupabase.from("participants").select("id, session_id, display_name, score, joined_at").in("session_id", sessionIds) : Promise.resolve({ data: [], error: null }),
+    sessionIds.length ? window.pulseplaySupabase.from("responses").select("id, session_id, question_id, participant_id, payload, is_correct, points, submitted_at, question_title, question_type, question_options").in("session_id", sessionIds) : Promise.resolve({ data: [], error: null }),
+    activityIds.length ? window.pulseplaySupabase.from("questions").select("id, activity_id, position, type, title, options, correct_option, settings").in("activity_id", activityIds) : Promise.resolve({ data: [], error: null }),
+  ]);
+  if (participantsResult.error) throw participantsResult.error;
+  if (responsesResult.error) throw responsesResult.error;
+  if (questionsResult.error) throw questionsResult.error;
+
+  sessionHistory = (sessions || []).map(session => ({
+    ...session,
+    participants: (participantsResult.data || []).filter(item => item.session_id === session.id),
+    responses: (responsesResult.data || []).filter(item => item.session_id === session.id),
+    questions: (questionsResult.data || []).filter(item => item.activity_id === session.activity_id).sort((a, b) => a.position - b.position),
+  }));
+  historyReady = true;
 }
 
 function databaseQuestionToLocal(question) {
@@ -312,6 +349,7 @@ function adminShell(content, active = "dashboard") {
       <div><div class="eyebrow">Espacio de trabajo</div><h3>PulsePlay Studio</h3></div>
       <nav class="admin-nav">
         <button class="${active === "dashboard" ? "active" : ""}" data-nav="/dashboard">Actividades</button>
+        <button class="${active === "results" ? "active" : ""}" data-nav="/results">Resultados</button>
         <button class="${active === "users" ? "active" : ""}" data-nav="/users">Usuarios</button>
         <button class="${active === "profile" ? "active" : ""}" data-nav="/profile">Mi perfil</button>
         ${hasActiveSession ? `<button class="live-session-link" data-nav="/admin"><span class="status-dot"></span>Sesión activa</button>` : ""}
@@ -357,6 +395,55 @@ function resetView(email) {
 function dashboardView() {
   const activities = getOwnedActivities();
   return adminShell(`<div class="admin-heading"><div><div class="eyebrow">Biblioteca</div><h1>Mis actividades</h1><p class="muted">Crea contenido y déjalo listo para una sesión en vivo.</p></div><button class="btn" id="new-activity">+ Nueva actividad</button></div><div class="library-toolbar"><label class="library-search"><span>⌕</span><input id="activity-search" value="${escapeAttr(libraryState.query)}" placeholder="Buscar por nombre o descripción…" /></label><label class="sort-control"><span>Ordenar por</span><select id="activity-sort"><option value="recent" ${libraryState.sort === "recent" ? "selected" : ""}>Más recientes primero</option><option value="oldest" ${libraryState.sort === "oldest" ? "selected" : ""}>Más antiguas primero</option><option value="name" ${libraryState.sort === "name" ? "selected" : ""}>Nombre A–Z</option><option value="name-desc" ${libraryState.sort === "name-desc" ? "selected" : ""}>Nombre Z–A</option></select></label></div><div id="library-results">${libraryResultsMarkup(activities)}</div>`, "dashboard");
+}
+
+function sessionActivityTitle(session) {
+  return getOwnedActivities().find(activity => activity.id === session.activity_id)?.title || "Actividad eliminada";
+}
+
+function sessionStatusLabel(status) {
+  return ({ lobby: "En espera", question: "En curso", results: "Resultados", leaderboard: "Leaderboard", finished: "Finalizada" })[status] || status;
+}
+
+function resultsView() {
+  if (!historyReady) return adminShell(`<section class="panel results-empty"><h2>Cargando resultados...</h2></section>`, "results");
+  const rows = sessionHistory.map(session => `<article class="history-row">
+    <div><strong>${escapeHtml(sessionActivityTitle(session))}</strong><small>Sala ${escapeHtml(session.code)} · ${formatDate(new Date(session.created_at).getTime())}</small></div>
+    <span class="activity-status">${sessionStatusLabel(session.status)}</span>
+    <span><b>${session.participants.length}</b> participantes</span>
+    <span><b>${session.responses.length}</b> respuestas</span>
+    <button class="btn secondary" data-nav="/results/${session.id}">Ver detalle</button>
+  </article>`).join("");
+  return adminShell(`<div class="admin-heading"><div><div class="eyebrow">Historial</div><h1>Resultados</h1><p class="muted">Revisa la participación y las respuestas de tus sesiones anteriores.</p></div><button class="btn secondary" id="refresh-results">Actualizar</button></div><section class="panel history-list">${rows || `<div class="results-empty"><strong>Aún no hay sesiones registradas</strong><span class="muted">Cuando presentes una actividad, sus respuestas aparecerán aquí.</span></div>`}</section>`, "results");
+}
+
+function responseValue(response, question) {
+  const payload = response.payload || {};
+  const options = question?.options || response.question_options || [];
+  if (Array.isArray(payload.ranking)) return payload.ranking.map(index => options[index] || `Opción ${index + 1}`).join(" > ");
+  if (payload.option !== undefined) return options[payload.option] || `Opción ${Number(payload.option) + 1}`;
+  if (payload.value !== undefined) return String(payload.value);
+  return payload.text || payload.word || "Sin contenido";
+}
+
+function sessionResultsView(sessionId) {
+  const session = sessionHistory.find(item => item.id === sessionId);
+  if (!session) return resultsView();
+  const participantMap = new Map(session.participants.map(item => [item.id, item]));
+  const questionMap = new Map(session.questions.map(item => [item.id, item]));
+  const grouped = new Map();
+  session.responses.forEach(response => {
+    const key = response.question_id || `${response.question_type}:${response.question_title}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(response);
+  });
+  const questions = [...grouped.entries()].map(([questionId, responses]) => {
+    const first = responses[0];
+    const question = questionMap.get(questionId) || { title: first.question_title || "Pregunta", type: first.question_type, options: first.question_options || [] };
+    return `<article class="history-question"><div class="history-question-head"><div><span class="type-badge">${typeLabel(question.type)}</span><h3>${escapeHtml(question.title)}</h3></div><strong>${responses.length} respuestas</strong></div><div class="response-history-list">${responses.map(response => `<div class="response-history-row"><span><strong>${escapeHtml(participantMap.get(response.participant_id)?.display_name || "Participante")}</strong><small>${new Date(response.submitted_at).toLocaleString("es-CL")}</small></span><p>${escapeHtml(responseValue(response, question))}</p>${response.is_correct === null ? "" : `<b class="${response.is_correct ? "correct-answer" : "wrong-answer"}">${response.is_correct ? "Correcta" : "Incorrecta"}${response.points ? ` · ${response.points} pts` : ""}</b>`}</div>`).join("")}</div></article>`;
+  }).join("");
+  const leaderboard = [...session.participants].sort((a, b) => b.score - a.score).map((participant, index) => `<div class="leaderboard-history-row"><b>${index + 1}</b><span>${escapeHtml(participant.display_name)}</span><strong>${participant.score} pts</strong></div>`).join("");
+  return adminShell(`<div class="editor-top"><button class="admin-link" data-nav="/results">← Volver a resultados</button><button class="btn secondary" id="refresh-results">Actualizar</button></div><div class="admin-heading"><div><div class="eyebrow">Sala ${escapeHtml(session.code)}</div><h1>${escapeHtml(sessionActivityTitle(session))}</h1><p class="muted">${sessionStatusLabel(session.status)} · ${new Date(session.created_at).toLocaleString("es-CL")}</p></div></div><div class="results-summary"><section class="panel metric"><span class="muted">Participantes</span><strong>${session.participants.length}</strong></section><section class="panel metric"><span class="muted">Respuestas</span><strong>${session.responses.length}</strong></section><section class="panel metric"><span class="muted">Preguntas respondidas</span><strong>${grouped.size}</strong></section></div><div class="results-detail-grid"><section class="panel leaderboard-history"><div class="eyebrow">Leaderboard</div><h2>Clasificación final</h2>${leaderboard || `<p class="muted">Sin participantes con puntaje.</p>`}</section><section class="question-history">${questions || `<div class="panel results-empty"><strong>No hubo respuestas en esta sesión</strong></div>`}</section></div>`, "results");
 }
 
 function libraryResultsMarkup(activities) {
@@ -600,7 +687,7 @@ function bindEvents() {
     if (!window.pulseplaySupabase) return showToast("Falta agregar la clave pública de Supabase");
     const { error } = await window.pulseplaySupabase.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo: `${location.origin}${location.pathname}#/dashboard` },
+      options: { redirectTo: authRedirect() },
     });
     if (error) showToast(error.message);
   });
@@ -636,7 +723,7 @@ function bindEvents() {
       const { data: authData, error } = await window.pulseplaySupabase.auth.signUp({
         email,
         password,
-        options: { data: { full_name: name }, emailRedirectTo: `${location.origin}${location.pathname}?confirmed=1` },
+        options: { data: { full_name: name }, emailRedirectTo: `${authRedirect()}?confirmed=1` },
       });
       if (error) return showToast(error.message);
       if (authData.session) {
@@ -663,7 +750,7 @@ function bindEvents() {
     const email = String(new FormData(event.currentTarget).get("email")).trim().toLowerCase();
     if (window.isSupabaseConfigured?.()) {
       if (!window.pulseplaySupabase) return showToast("Supabase no está disponible. Recarga la página");
-      const { error } = await window.pulseplaySupabase.auth.resetPasswordForEmail(email, { redirectTo: `${location.origin}${location.pathname}#/reset-password` });
+      const { error } = await window.pulseplaySupabase.auth.resetPasswordForEmail(email, { redirectTo: authRedirect() });
       if (error) return showToast(error.message);
       navigate("/login");
       showToast("Te enviamos un enlace para restablecer tu contraseña");
@@ -752,6 +839,10 @@ function bindEvents() {
     }
     render();
     showToast("Perfil actualizado");
+  });
+  document.querySelector("#refresh-results")?.addEventListener("click", async () => {
+    try { await loadSessionHistory(); render(); showToast("Resultados actualizados"); }
+    catch (error) { showToast(error.message || "No se pudieron actualizar los resultados"); }
   });
   const activityForm = document.querySelector("#activity-form");
   activityForm?.addEventListener("input", () => { editorDirty = true; updateSaveState(); });
@@ -911,6 +1002,8 @@ function render() {
   else if (route === "/play") view = participantView(room);
   else if (route === "/admin") view = presenterView(room);
   else if (route === "/dashboard") view = requireAdmin() ? dashboardView() : "";
+  else if (route === "/results") view = requireAdmin() ? resultsView() : "";
+  else if (route.startsWith("/results/")) view = requireAdmin() ? sessionResultsView(route.split("/")[2]) : "";
   else if (route === "/users") view = requireAdmin() ? usersView() : "";
   else if (route === "/profile") view = requireAdmin() ? profileView() : "";
   else if (route.startsWith("/editor/")) view = requireAdmin() ? editorView(route.split("/")[2]) : "";
