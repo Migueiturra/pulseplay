@@ -24,6 +24,9 @@ let localPlayer = readJson(sessionStorage.getItem("pulseplay-player"), null);
 let supabaseAdmin = null;
 let authReady = false;
 let activitiesReady = false;
+let liveRoomCache = null;
+let liveSyncHandle = null;
+const LIVE_CODE_KEY = "pulseplay-live-code";
 const clientId = sessionStorage.getItem(CLIENT_KEY) || crypto.randomUUID();
 sessionStorage.setItem(CLIENT_KEY, clientId);
 
@@ -198,10 +201,10 @@ async function initializeAuth() {
   });
   authReady = true;
 }
-function getRoom() { return { ...defaultRoom(), ...readJson(localStorage.getItem(ROOM_KEY), {}) }; }
+function getRoom() { return liveRoomCache || { ...defaultRoom(), ...readJson(localStorage.getItem(ROOM_KEY), {}) }; }
 function getActivity(id = getRoom().activityId) { return getActivities().find(item => item.id === id) || getActivities()[0]; }
 function getOwnedActivity(id) { const admin = getAdmin(); return getActivities().find(item => item.id === id && item.workspaceId === (admin?.workspaceId || admin?.id)); }
-function getQuestions(room = getRoom()) { return getActivity(room.activityId)?.questions || []; }
+function getQuestions(room = getRoom()) { return room.questions?.length ? room.questions : getActivity(room.activityId)?.questions || []; }
 
 function saveRoom(next) {
   next.version = (next.version || 0) + 1;
@@ -214,6 +217,77 @@ function mutateRoom(fn) { const room = getRoom(); fn(room); saveRoom(room); }
 function navigate(path) { location.hash = path; }
 function createRoomCode() { return String(crypto.getRandomValues(new Uint32Array(1))[0] % 9000 + 1000); }
 function roomForActivity(activityId) { return { ...defaultRoom(), code: createRoomCode(), activityId }; }
+
+function setLiveRoom(room) {
+  if (!room) return null;
+  liveRoomCache = { ...defaultRoom(), ...room, startedAt: Number(room.startedAt) || null, endsAt: Number(room.endsAt) || null };
+  sessionStorage.setItem(LIVE_CODE_KEY, liveRoomCache.code);
+  if (room.player) {
+    localPlayer = room.player;
+    sessionStorage.setItem("pulseplay-player", JSON.stringify(localPlayer));
+  }
+  return liveRoomCache;
+}
+
+async function fetchLiveRoom(shouldRender = true) {
+  if (!window.pulseplaySupabase) return null;
+  const code = liveRoomCache?.code || sessionStorage.getItem(LIVE_CODE_KEY);
+  if (!code) return null;
+  const { data, error } = await window.pulseplaySupabase.rpc("pulseplay_live_state", {
+    p_code: code,
+    p_client_id: localPlayer?.clientId || clientId,
+  });
+  if (error || !data) return null;
+  const previous = JSON.stringify(liveRoomCache);
+  setLiveRoom(data);
+  if (shouldRender && previous !== JSON.stringify(liveRoomCache)) render();
+  return liveRoomCache;
+}
+
+async function createLiveSession(activityId) {
+  if (!window.pulseplaySupabase) {
+    saveRoom(roomForActivity(activityId));
+    return getRoom();
+  }
+  const { data, error } = await window.pulseplaySupabase.rpc("pulseplay_create_live_session", { p_activity_id: activityId });
+  if (error) throw error;
+  return setLiveRoom(data);
+}
+
+async function joinLiveSession(code, name) {
+  if (!window.pulseplaySupabase) return null;
+  const { data, error } = await window.pulseplaySupabase.rpc("pulseplay_join_live_session", {
+    p_code: code,
+    p_client_id: clientId,
+    p_display_name: name,
+  });
+  if (error) throw error;
+  return setLiveRoom(data);
+}
+
+async function submitLiveResponse(payload) {
+  const room = getRoom();
+  const { data, error } = await window.pulseplaySupabase.rpc("pulseplay_submit_response", {
+    p_code: room.code,
+    p_client_id: localPlayer?.clientId || clientId,
+    p_payload: payload,
+  });
+  if (error) throw error;
+  setLiveRoom(data);
+  render();
+}
+
+async function controlLiveSession(action, participantId = null) {
+  const room = getRoom();
+  const { data, error } = await window.pulseplaySupabase.rpc("pulseplay_control_live_session", {
+    p_session_id: room.id,
+    p_action: action,
+    p_participant_id: participantId,
+  });
+  if (error) throw error;
+  setLiveRoom(data);
+  render();
+}
 
 function showToast(message) {
   document.querySelector(".toast")?.remove();
@@ -232,7 +306,7 @@ function shell(content, actions = "") {
 function adminShell(content, active = "dashboard") {
   const admin = getAdmin();
   const liveRoom = getRoom();
-  const hasActiveSession = liveRoom.status !== "lobby" || liveRoom.participants.length > 0;
+  const hasActiveSession = Boolean(liveRoom.code) && liveRoom.status !== "finished";
   return shell(`<main class="admin-layout">
     <aside class="panel admin-sidebar">
       <div><div class="eyebrow">Espacio de trabajo</div><h3>PulsePlay Studio</h3></div>
@@ -362,7 +436,7 @@ function participantView(room) {
   else if (current.type === "scale") body = scaleParticipantMarkup(room, current, submitted, questions.length);
   else if (current.type === "ranking") body = rankingParticipantMarkup(room, current, submitted, questions.length);
   else if (current.type === "openended") body = `<section class="panel stage-card waiting">${timerMarkup(room, current)}<div class="question-count">Pregunta ${room.index + 1} de ${questions.length}</div><h1 class="question-title centered">${escapeHtml(current.title)}</h1>${submitted ? `<div class="open-response-sent"><strong>Respuesta enviada</strong><p>${escapeHtml(submitted.text)}</p></div>` : `<form id="openended-form" class="openended-form"><textarea name="text" maxlength="280" rows="5" placeholder="Escribe una respuesta breve…" required></textarea><div><span class="muted">Máximo 280 caracteres</span><button class="btn">Enviar respuesta</button></div></form>`}</section>`;
-  else if (current.type === "wordcloud") body = `<section class="panel stage-card waiting">${timerMarkup(room, current)}<div class="question-count">Pregunta ${room.index + 1} de ${questions.length}</div><h1 class="question-title">${escapeHtml(current.title)}</h1>${room.words.some(w => w.playerId === localPlayer.id) ? `<p class="eyebrow">Respuesta enviada</p><div class="cloud">${cloudMarkup(room.words)}</div>` : `<form id="word-form" class="word-form"><input name="word" maxlength="28" placeholder="Escribe una palabra…" required /><button class="btn">Enviar</button></form>`}</section>`;
+  else if (current.type === "wordcloud") body = `<section class="panel stage-card waiting">${timerMarkup(room, current)}<div class="question-count">Pregunta ${room.index + 1} de ${questions.length}</div><h1 class="question-title">${escapeHtml(current.title)}</h1>${submitted ? `<p class="eyebrow">Respuesta enviada</p><p class="muted">La nube aparecerá al cerrar la pregunta.</p>` : `<form id="word-form" class="word-form"><input name="word" maxlength="28" placeholder="Escribe una palabra…" required /><button class="btn">Enviar</button></form>`}</section>`;
   else body = `<section class="panel stage-card">${timerMarkup(room, current)}<div class="question-count">Pregunta ${room.index + 1} de ${questions.length}</div><h1 class="question-title">${escapeHtml(current.title)}</h1><div class="answers">${current.options.map((option, i) => { const selected = submitted?.option === i; return `<button class="answer ${selected ? "selected" : ""}" data-answer="${i}" ${submitted ? "disabled" : ""}><span class="letter">${"ABCD"[i]}</span><strong>${escapeHtml(option)}</strong></button>`; }).join("")}</div>${submitted ? `<p class="muted response-message">Respuesta enviada. Esperando…</p>` : ""}</section>`;
   return shell(`<main class="room"><div class="room-head"><div><div class="eyebrow">Participante</div><strong>${escapeHtml(localPlayer.name)} · ${playerScore(room, localPlayer.id)} pts</strong></div><div class="room-code"><span class="status-dot"></span>Sala <strong>${room.code}</strong></div></div>${body}</main>`);
 }
@@ -373,7 +447,7 @@ function presenterView(room) {
   const current = questions[room.index];
   const questionAnswers = Object.entries(room.answers).filter(([key]) => key.startsWith(`${room.index}:`));
   let stage = "";
-  if (room.status === "lobby") stage = `<section class="panel stage-card waiting"><div class="eyebrow">Sala abierta</div><h1>Únete con el código <span class="gradient-text">${room.code}</span></h1><p class="muted">${escapeHtml(activity?.title || "Actividad")}</p><div class="player-list">${room.participants.length ? room.participants.map(p => `<span class="player-pill">${escapeHtml(p.name)}</span>`).join("") : `<span class="muted">Esperando participantes…</span>`}</div></section>`;
+  if (room.status === "lobby") stage = `<section class="panel stage-card waiting"><div class="eyebrow">Sala abierta</div><h1>Únete con el código <span class="gradient-text">${room.code}</span></h1><p class="muted">${escapeHtml(activity?.title || room.activityTitle || "Actividad")}</p><div class="player-list">${room.participants.length ? room.participants.map(p => `<span class="player-pill">${escapeHtml(p.name)}</span>`).join("") : `<span class="muted">Esperando participantes…</span>`}</div></section>`;
   else if (room.status === "finished") stage = leaderboardMarkup(room, "Resultados finales");
   else if (room.status === "leaderboard") stage = leaderboardMarkup(room, "Clasificación provisional");
   else if (room.status === "results") stage = presenterResultsMarkup(room, current, questionAnswers);
@@ -383,7 +457,7 @@ function presenterView(room) {
   else if (current) { const counts = current.options.map((_, option) => questionAnswers.filter(([, value]) => value.option === option).length); stage = `<section class="panel stage-card">${timerMarkup(room, current)}<div class="question-count">Pregunta ${room.index + 1} de ${questions.length}</div><h1 class="question-title">${escapeHtml(current.title)}</h1><div class="answers">${current.options.map((option, i) => `<div class="answer ${room.reveal && current.type === "quiz" && i === current.correct ? "correct" : ""}"><span class="letter">${"ABCD"[i]}</span><strong class="flex-grow">${escapeHtml(option)}</strong>${room.reveal ? `<b>${counts[i]}</b>` : ""}</div>`).join("")}</div></section>`; }
   else stage = `<section class="panel stage-card waiting"><h1>Agrega preguntas antes de presentar</h1><button class="btn" data-nav="/editor/${activity?.id}">Abrir editor</button></section>`;
   const primaryLabel = room.status === "lobby" ? "Comenzar actividad" : room.status === "question" ? "Cerrar respuestas" : room.status === "results" ? "Ver clasificación" : room.status === "leaderboard" ? (room.index === questions.length - 1 ? "Finalizar actividad" : "Siguiente pregunta") : "Reiniciar demo";
-  return shell(`<main class="room"><div class="room-head"><div><div class="eyebrow">Panel del presentador</div><strong>${escapeHtml(activity?.title || "Actividad")}</strong></div><div class="room-code"><span class="status-dot"></span>Sala <strong>${room.code}</strong></div></div><div class="presenter-grid"><div>${stage}</div><aside class="panel control-panel"><h3>Control en vivo</h3><div class="metric"><span class="muted">Participantes</span><strong>${room.participants.length}</strong></div><div class="metric"><span class="muted">Respuestas</span><strong>${current?.type === "wordcloud" ? room.words.length : questionAnswers.length}</strong></div><div class="participant-control"><span class="control-label">En la sala</span>${room.participants.length ? room.participants.map(player => `<div class="participant-row"><span>${escapeHtml(player.name)}</span><button class="kick-player" data-id="${player.id}" title="Expulsar">×</button></div>`).join("") : `<small class="muted">Sin participantes</small>`}</div><div class="steps">${questions.map((q, i) => `<div class="step ${room.status !== "lobby" && i === room.index ? "active" : ""}">${i + 1}. ${typeLabel(q.type)}</div>`).join("")}<div class="step ${["leaderboard", "finished"].includes(room.status) ? "active" : ""}">★ Leaderboard</div></div><button id="admin-next" class="btn purple" ${questions.length ? "" : "disabled"}>${primaryLabel}</button><button id="reset-room" class="btn secondary">Vaciar sala</button><button class="admin-link" data-nav="/dashboard">Volver al estudio</button></aside></div></main>`, getAdmin() ? `<button class="admin-link" id="admin-logout">Cerrar sesión</button>` : `<button class="admin-link" data-nav="/login">Administrar</button>`);
+  return shell(`<main class="room"><div class="room-head"><div><div class="eyebrow">Panel del presentador</div><strong>${escapeHtml(activity?.title || room.activityTitle || "Actividad")}</strong></div><div class="room-code"><span class="status-dot"></span>Sala <strong>${room.code}</strong></div></div><div class="presenter-grid"><div>${stage}</div><aside class="panel control-panel"><h3>Control en vivo</h3><div class="metric"><span class="muted">Participantes</span><strong>${room.participants.length}</strong></div><div class="metric"><span class="muted">Respuestas</span><strong>${current?.type === "wordcloud" ? room.words.length : questionAnswers.length}</strong></div><div class="participant-control"><span class="control-label">En la sala</span>${room.participants.length ? room.participants.map(player => `<div class="participant-row"><span>${escapeHtml(player.name)}</span><button class="kick-player" data-id="${player.id}" title="Expulsar">×</button></div>`).join("") : `<small class="muted">Sin participantes</small>`}</div><div class="steps">${questions.map((q, i) => `<div class="step ${room.status !== "lobby" && i === room.index ? "active" : ""}">${i + 1}. ${typeLabel(q.type)}</div>`).join("")}<div class="step ${["leaderboard", "finished"].includes(room.status) ? "active" : ""}">★ Leaderboard</div></div><button id="admin-next" class="btn purple" ${questions.length ? "" : "disabled"}>${primaryLabel}</button><button id="reset-room" class="btn secondary">Vaciar sala</button><button class="admin-link" data-nav="/dashboard">Volver al estudio</button></aside></div></main>`, getAdmin() ? `<button class="admin-link" id="admin-logout">Cerrar sesión</button>` : `<button class="admin-link" data-nav="/login">Administrar</button>`);
 }
 
 function participantResultsMarkup(room, current, submitted) {
@@ -414,7 +488,7 @@ function resultsBarsMarkup(current, counts, selectedOption = -1) {
 }
 
 function leaderboardMarkup(room, title) { const players = [...room.participants].sort((a, b) => playerScore(room, b.id) - playerScore(room, a.id)); return `<section class="panel stage-card waiting"><div class="eyebrow">Leaderboard competitivo</div><h1 class="question-title centered">${title}</h1><p class="muted">Solo las respuestas correctas de trivia suman puntos.</p><div class="leaderboard">${players.length ? players.map((p, i) => `<div class="leader-row"><span class="rank">${i + 1}</span><strong>${escapeHtml(p.name)}</strong><span class="points">${playerScore(room, p.id)} pts</span></div>`).join("") : `<p class="muted">Aún no hay participantes.</p>`}</div></section>`; }
-function playerScore(room, playerId) { return Object.entries(room.answers).filter(([key]) => key.endsWith(`:${playerId}`)).reduce((sum, [, answer]) => sum + (answer.points || 0), 0); }
+function playerScore(room, playerId) { const participant = room.participants.find(player => player.id === playerId); if (Number.isFinite(participant?.score)) return participant.score; return Object.entries(room.answers).filter(([key]) => key.endsWith(`:${playerId}`)).reduce((sum, [, answer]) => sum + (answer.points || 0), 0); }
 function timerMarkup(room, current) { if (room.status !== "question") return ""; if (!room.endsAt) return `<div class="untimed-badge"><span class="status-dot"></span>Sin límite de tiempo</div>`; const remaining = Math.max(0, Math.ceil((room.endsAt - Date.now()) / 1000)); return `<div class="timer-wrap"><div class="timer"><div class="timer-fill" style="width:${remaining / current.duration * 100}%"></div></div><strong class="timer-number">${remaining}</strong></div>`; }
 function cloudMarkup(words) { const grouped = words.reduce((acc, item) => { const key = item.word.toLowerCase(); acc[key] = (acc[key] || 0) + 1; return acc; }, {}); return Object.entries(grouped).sort((a,b) => b[1] - a[1]).map(([word, count]) => `<span style="font-size:${22 + count * 11}px">${escapeHtml(word)}</span>`).join(""); }
 function openResponsesMarkup(room) { const responses = Object.entries(room.answers).filter(([key, value]) => key.startsWith(`${room.index}:`) && value.text).map(([key, value]) => ({ ...value, playerId: key.split(":")[1] })); return `<div class="open-response-grid">${responses.length ? responses.map(response => `<article class="open-response-card"><p>${escapeHtml(response.text)}</p><span>${escapeHtml(room.participants.find(player => player.id === response.playerId)?.name || "Participante")}</span></article>`).join("") : `<div class="empty-responses"><strong>No se recibieron respuestas</strong><span class="muted">La grilla aparecerá aquí.</span></div>`}</div>`; }
@@ -617,7 +691,23 @@ function bindEvents() {
     navigate("/login");
     showToast("Contraseña actualizada");
   });
-  document.querySelector("#join-form")?.addEventListener("submit", event => { event.preventDefault(); const data = new FormData(event.currentTarget); const room = getRoom(); if (!room.code || String(data.get("code")).trim() !== room.code) return showToast("Código de sala incorrecto"); localPlayer = { id: clientId, name: String(data.get("name")).trim() }; sessionStorage.setItem("pulseplay-player", JSON.stringify(localPlayer)); mutateRoom(next => { const existing = next.participants.find(p => p.id === localPlayer.id); if (existing) existing.name = localPlayer.name; else next.participants.push(localPlayer); }); navigate("/play"); });
+  document.querySelector("#join-form")?.addEventListener("submit", async event => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const code = String(data.get("code")).trim();
+    const name = String(data.get("name")).trim();
+    if (window.pulseplaySupabase) {
+      try { await joinLiveSession(code, name); navigate("/play"); }
+      catch (error) { showToast(error.message || "No se pudo entrar a la sala"); }
+      return;
+    }
+    const room = getRoom();
+    if (!room.code || code !== room.code) return showToast("Código de sala incorrecto");
+    localPlayer = { id: clientId, clientId, name };
+    sessionStorage.setItem("pulseplay-player", JSON.stringify(localPlayer));
+    mutateRoom(next => { const existing = next.participants.find(p => p.id === localPlayer.id); if (existing) existing.name = localPlayer.name; else next.participants.push(localPlayer); });
+    navigate("/play");
+  });
   document.querySelector("#new-activity")?.addEventListener("click", async () => {
     const id = crypto.randomUUID();
     const admin = getAdmin();
@@ -637,7 +727,10 @@ function bindEvents() {
     navigate(`/editor/${id}`);
   });
   document.querySelectorAll(".edit-activity").forEach(button => button.addEventListener("click", () => navigate(`/editor/${button.dataset.id}`)));
-  document.querySelectorAll(".present-activity").forEach(button => button.addEventListener("click", () => { saveRoom(roomForActivity(button.dataset.id)); navigate("/admin"); }));
+  document.querySelectorAll(".present-activity").forEach(button => button.addEventListener("click", async () => {
+    try { await createLiveSession(button.dataset.id); navigate("/admin"); }
+    catch (error) { showToast(error.message || "No se pudo crear la sala"); }
+  }));
   document.querySelector("#activity-search")?.addEventListener("input", event => { libraryState.query = event.target.value; libraryState.page = 1; refreshLibraryResults(); });
   document.querySelector("#activity-sort")?.addEventListener("change", event => { libraryState.sort = event.target.value; libraryState.page = 1; refreshLibraryResults(); });
   document.querySelector("#activity-page-size")?.addEventListener("change", event => { libraryState.pageSize = Number(event.target.value); libraryState.page = 1; refreshLibraryResults(); });
@@ -672,17 +765,50 @@ function bindEvents() {
   }));
   document.querySelectorAll(".delete-question").forEach(button => button.addEventListener("click", () => updateEditorActivity(document.querySelector("#activity-form"), activity => { activity.questions = activity.questions.filter(q => q.id !== button.closest(".question-editor").dataset.questionId); })));
   document.querySelectorAll(".move-up, .move-down").forEach(button => button.addEventListener("click", () => updateEditorActivity(document.querySelector("#activity-form"), activity => { const id = button.closest(".question-editor").dataset.questionId; const from = activity.questions.findIndex(q => q.id === id); const to = button.classList.contains("move-up") ? from - 1 : from + 1; if (to < 0 || to >= activity.questions.length) return; [activity.questions[from], activity.questions[to]] = [activity.questions[to], activity.questions[from]]; })));
-  document.querySelectorAll("[data-answer]").forEach(button => button.addEventListener("click", () => { const room = getRoom(); if (questionIsClosed(room)) { closeExpiredQuestion(); return showToast("La pregunta ya está cerrada"); } const current = getQuestions(room)[room.index]; const option = Number(button.dataset.answer); const elapsed = Math.max(0, (Date.now() - room.startedAt) / 1000); const correct = current.type !== "quiz" || option === current.correct; const speedBonus = current.duration > 0 ? Math.max(0, Math.round((current.duration - elapsed) / current.duration * 500)) : 0; const points = current.type === "quiz" && correct ? 500 + speedBonus : 0; mutateRoom(next => { next.answers[`${next.index}:${localPlayer.id}`] = { option, correct, points }; }); showToast("¡Respuesta enviada!"); }));
-  document.querySelector("#word-form")?.addEventListener("submit", event => { event.preventDefault(); const liveRoom = getRoom(); if (questionIsClosed(liveRoom)) { closeExpiredQuestion(); return showToast("La pregunta ya está cerrada"); } const word = String(new FormData(event.currentTarget).get("word")).trim().split(/\s+/).slice(0, 2).join(" "); if (!word) return; mutateRoom(room => room.words.push({ word, playerId: localPlayer.id })); showToast("¡Palabra enviada!"); });
-  document.querySelector("#openended-form")?.addEventListener("submit", event => { event.preventDefault(); const liveRoom = getRoom(); if (questionIsClosed(liveRoom)) { closeExpiredQuestion(); return showToast("La pregunta ya está cerrada"); } const text = String(new FormData(event.currentTarget).get("text")).trim(); if (!text) return; mutateRoom(room => { room.answers[`${room.index}:${localPlayer.id}`] = { text, submittedAt: Date.now(), points: 0 }; }); showToast("¡Respuesta enviada!"); });
-  document.querySelector("#scale-form")?.addEventListener("submit", event => { event.preventDefault(); const liveRoom = getRoom(); if (questionIsClosed(liveRoom)) { closeExpiredQuestion(); return showToast("La pregunta ya está cerrada"); } const value = Number(new FormData(event.currentTarget).get("value")); mutateRoom(room => { room.answers[`${room.index}:${localPlayer.id}`] = { value, submittedAt: Date.now(), points: 0 }; }); showToast("¡Valoración enviada!"); });
+  document.querySelectorAll("[data-answer]").forEach(button => button.addEventListener("click", async () => {
+    const room = getRoom();
+    if (questionIsClosed(room)) return showToast("La pregunta ya está cerrada");
+    const option = Number(button.dataset.answer);
+    if (room.id && window.pulseplaySupabase) {
+      try { await submitLiveResponse({ option }); showToast("¡Respuesta enviada!"); }
+      catch (error) { showToast(error.message || "No se pudo enviar la respuesta"); }
+      return;
+    }
+    const current = getQuestions(room)[room.index];
+    const elapsed = Math.max(0, (Date.now() - room.startedAt) / 1000);
+    const correct = current.type !== "quiz" || option === current.correct;
+    const speedBonus = current.duration > 0 ? Math.max(0, Math.round((current.duration - elapsed) / current.duration * 500)) : 0;
+    const points = current.type === "quiz" && correct ? 500 + speedBonus : 0;
+    mutateRoom(next => { next.answers[`${next.index}:${localPlayer.id}`] = { option, correct, points }; });
+    showToast("¡Respuesta enviada!");
+  }));
+  document.querySelector("#word-form")?.addEventListener("submit", async event => { event.preventDefault(); const liveRoom = getRoom(); if (questionIsClosed(liveRoom)) return showToast("La pregunta ya está cerrada"); const word = String(new FormData(event.currentTarget).get("word")).trim().split(/\s+/).slice(0, 2).join(" "); if (!word) return; if (liveRoom.id && window.pulseplaySupabase) { try { await submitLiveResponse({ word }); showToast("¡Palabra enviada!"); } catch (error) { showToast(error.message); } return; } mutateRoom(room => room.words.push({ word, playerId: localPlayer.id })); showToast("¡Palabra enviada!"); });
+  document.querySelector("#openended-form")?.addEventListener("submit", async event => { event.preventDefault(); const liveRoom = getRoom(); if (questionIsClosed(liveRoom)) return showToast("La pregunta ya está cerrada"); const text = String(new FormData(event.currentTarget).get("text")).trim(); if (!text) return; if (liveRoom.id && window.pulseplaySupabase) { try { await submitLiveResponse({ text }); showToast("¡Respuesta enviada!"); } catch (error) { showToast(error.message); } return; } mutateRoom(room => { room.answers[`${room.index}:${localPlayer.id}`] = { text, submittedAt: Date.now(), points: 0 }; }); showToast("¡Respuesta enviada!"); });
+  document.querySelector("#scale-form")?.addEventListener("submit", async event => { event.preventDefault(); const liveRoom = getRoom(); if (questionIsClosed(liveRoom)) return showToast("La pregunta ya está cerrada"); const value = Number(new FormData(event.currentTarget).get("value")); if (liveRoom.id && window.pulseplaySupabase) { try { await submitLiveResponse({ value }); showToast("¡Valoración enviada!"); } catch (error) { showToast(error.message); } return; } mutateRoom(room => { room.answers[`${room.index}:${localPlayer.id}`] = { value, submittedAt: Date.now(), points: 0 }; }); showToast("¡Valoración enviada!"); });
   document.querySelectorAll(".rank-up, .rank-down").forEach(button => button.addEventListener("click", () => { const item = button.closest(".ranking-item"); const sibling = button.classList.contains("rank-up") ? item.previousElementSibling : item.nextElementSibling; if (!sibling) return; if (button.classList.contains("rank-up")) item.parentElement.insertBefore(item, sibling); else item.parentElement.insertBefore(sibling, item); refreshRankingNumbers(); }));
-  document.querySelector("#ranking-form")?.addEventListener("submit", event => { event.preventDefault(); const liveRoom = getRoom(); if (questionIsClosed(liveRoom)) { closeExpiredQuestion(); return showToast("La pregunta ya está cerrada"); } const ranking = [...event.currentTarget.querySelectorAll(".ranking-item")].map(item => Number(item.dataset.option)); mutateRoom(room => { room.answers[`${room.index}:${localPlayer.id}`] = { ranking, submittedAt: Date.now(), points: 0 }; }); showToast("¡Ranking enviado!"); });
-  document.querySelectorAll(".kick-player").forEach(button => button.addEventListener("click", () => mutateRoom(room => {
-    room.participants = room.participants.filter(player => player.id !== button.dataset.id);
-    room.blockedParticipants = [...new Set([...(room.blockedParticipants || []), button.dataset.id])];
-  })));
-  document.querySelector("#admin-next")?.addEventListener("click", () => mutateRoom(room => {
+  document.querySelector("#ranking-form")?.addEventListener("submit", async event => { event.preventDefault(); const liveRoom = getRoom(); if (questionIsClosed(liveRoom)) return showToast("La pregunta ya está cerrada"); const ranking = [...event.currentTarget.querySelectorAll(".ranking-item")].map(item => Number(item.dataset.option)); if (liveRoom.id && window.pulseplaySupabase) { try { await submitLiveResponse({ ranking }); showToast("¡Ranking enviado!"); } catch (error) { showToast(error.message); } return; } mutateRoom(room => { room.answers[`${room.index}:${localPlayer.id}`] = { ranking, submittedAt: Date.now(), points: 0 }; }); showToast("¡Ranking enviado!"); });
+  document.querySelectorAll(".kick-player").forEach(button => button.addEventListener("click", async () => {
+    const room = getRoom();
+    if (room.id && window.pulseplaySupabase) {
+      try { await controlLiveSession("kick", button.dataset.id); }
+      catch (error) { showToast(error.message); }
+      return;
+    }
+    mutateRoom(next => {
+      next.participants = next.participants.filter(player => player.id !== button.dataset.id);
+      next.blockedParticipants = [...new Set([...(next.blockedParticipants || []), button.dataset.id])];
+    });
+  }));
+  document.querySelector("#admin-next")?.addEventListener("click", async () => {
+    const liveRoom = getRoom();
+    if (liveRoom.id && window.pulseplaySupabase) {
+      try {
+        if (liveRoom.status === "finished") await createLiveSession(liveRoom.activityId);
+        else await controlLiveSession("next");
+      } catch (error) { showToast(error.message); }
+      return;
+    }
+    mutateRoom(room => {
     const questions = getQuestions(room);
     if (room.status === "lobby") { startQuestion(room, 0, questions); return; }
     if (room.status === "question") { closeQuestion(room); return; }
@@ -693,8 +819,18 @@ function bindEvents() {
       return;
     }
     if (room.status === "finished") { const activityId = room.activityId; Object.assign(room, roomForActivity(activityId)); }
-  }));
-  document.querySelector("#reset-room")?.addEventListener("click", () => { const activityId = getRoom().activityId; saveRoom(roomForActivity(activityId)); showToast("Sala reiniciada con un código nuevo"); });
+    });
+  });
+  document.querySelector("#reset-room")?.addEventListener("click", async () => {
+    const activityId = getRoom().activityId;
+    if (getRoom().id && window.pulseplaySupabase) {
+      try { await createLiveSession(activityId); showToast("Sala reiniciada con un código nuevo"); }
+      catch (error) { showToast(error.message); }
+      return;
+    }
+    saveRoom(roomForActivity(activityId));
+    showToast("Sala reiniciada con un código nuevo");
+  });
 }
 
 function refreshLibraryResults() {
@@ -706,7 +842,10 @@ function refreshLibraryResults() {
 
 function bindLibraryResultEvents() {
   document.querySelectorAll(".edit-activity").forEach(button => button.addEventListener("click", () => navigate(`/editor/${button.dataset.id}`)));
-  document.querySelectorAll(".present-activity").forEach(button => button.addEventListener("click", () => { saveRoom(roomForActivity(button.dataset.id)); navigate("/admin"); }));
+  document.querySelectorAll(".present-activity").forEach(button => button.addEventListener("click", async () => {
+    try { await createLiveSession(button.dataset.id); navigate("/admin"); }
+    catch (error) { showToast(error.message || "No se pudo crear la sala"); }
+  }));
   document.querySelector("#activity-page-size")?.addEventListener("change", event => { libraryState.pageSize = Number(event.target.value); libraryState.page = 1; refreshLibraryResults(); });
   document.querySelector("#page-prev")?.addEventListener("click", () => { libraryState.page -= 1; refreshLibraryResults(); });
   document.querySelector("#page-next")?.addEventListener("click", () => { libraryState.page += 1; refreshLibraryResults(); });
@@ -729,13 +868,23 @@ function closeQuestion(room) {
   room.endsAt = null;
 }
 
-function closeExpiredQuestion() {
+async function closeExpiredQuestion() {
   const room = getRoom();
-  if (room.status === "question" && room.endsAt && Date.now() >= room.endsAt) mutateRoom(closeQuestion);
+  if (room.status !== "question" || !room.endsAt || Date.now() < room.endsAt) return;
+  if (room.id && window.pulseplaySupabase) {
+    if (getAdmin()) {
+      try { await controlLiveSession("next"); } catch (error) { console.error(error); }
+    } else {
+      await fetchLiveRoom();
+    }
+    return;
+  }
+  mutateRoom(closeQuestion);
 }
 
 function render() {
   clearInterval(timerHandle);
+  clearInterval(liveSyncHandle);
   if (!authReady) {
     document.querySelector("#app").innerHTML = `<main class="auth-wrap"><section class="panel auth-card"><div class="eyebrow">PulsePlay</div><h2>Preparando tu espacio…</h2></section></main>`;
     return;
@@ -781,6 +930,9 @@ function render() {
     document.querySelectorAll(".timer-number").forEach(label => { label.textContent = remaining; });
     if (remaining <= 0) closeExpiredQuestion();
   }, 250);
+  if (window.pulseplaySupabase && sessionStorage.getItem(LIVE_CODE_KEY) && ["/play", "/admin"].includes(route)) {
+    liveSyncHandle = setInterval(() => fetchLiveRoom(), 1000);
+  }
 }
 
 window.addEventListener("hashchange", () => {
@@ -806,4 +958,7 @@ initializeAuth().catch(error => {
   console.error("No se pudo iniciar Supabase", error);
   authReady = true;
   render();
-}).then(() => render());
+}).then(async () => {
+  await fetchLiveRoom(false);
+  render();
+});
