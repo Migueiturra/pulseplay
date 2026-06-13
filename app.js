@@ -29,6 +29,9 @@ let liveRoomCache = null;
 let liveSyncHandle = null;
 let sessionHistory = [];
 let historyReady = false;
+let workspaceUsers = [];
+let workspaceInvitations = [];
+let usersReady = false;
 let authProviders = { email: true, google: false, ready: false };
 const LIVE_CODE_KEY = "pulseplay-live-code";
 const clientId = sessionStorage.getItem(CLIENT_KEY) || crypto.randomUUID();
@@ -83,6 +86,9 @@ async function loadSupabaseAdmin(user) {
   if (!user || !window.pulseplaySupabase) {
     supabaseAdmin = null;
     activitiesReady = false;
+    workspaceUsers = [];
+    workspaceInvitations = [];
+    usersReady = false;
     return;
   }
 
@@ -100,7 +106,47 @@ async function loadSupabaseAdmin(user) {
     createdAt: profile?.created_at ? new Date(profile.created_at).getTime() : Date.now(),
     provider: user.app_metadata?.provider || "email",
   };
-  await Promise.all([loadSupabaseActivities(), loadSessionHistory()]);
+  await Promise.all([loadSupabaseActivities(), loadSessionHistory(), loadWorkspaceUsers()]);
+}
+
+async function loadWorkspaceUsers() {
+  if (!window.pulseplaySupabase || !supabaseAdmin?.workspaceId) return;
+  const { data: memberships, error: membersError } = await window.pulseplaySupabase
+    .from("workspace_members")
+    .select("user_id, role, created_at, profiles!workspace_members_user_id_fkey(name, email, avatar_url)")
+    .eq("workspace_id", supabaseAdmin.workspaceId)
+    .order("created_at", { ascending: true });
+  if (membersError) {
+    console.warn("La gestión de equipo todavía no está disponible", membersError);
+    workspaceUsers = [{ ...supabaseAdmin }];
+    workspaceInvitations = [];
+    usersReady = true;
+    return;
+  }
+
+  workspaceUsers = (memberships || []).map(membership => {
+    const profile = Array.isArray(membership.profiles) ? membership.profiles[0] : membership.profiles;
+    return {
+      id: membership.user_id,
+      name: profile?.name || profile?.email?.split("@")[0] || "Usuario",
+      email: profile?.email || "",
+      role: membership.role,
+      createdAt: membership.created_at,
+    };
+  });
+
+  workspaceInvitations = [];
+  if (supabaseAdmin.role === "owner") {
+    const { data: invitations, error: invitationsError } = await window.pulseplaySupabase
+      .from("workspace_invitations")
+      .select("id, email, role, status, created_at")
+      .eq("workspace_id", supabaseAdmin.workspaceId)
+      .eq("status", "pending")
+      .order("created_at", { ascending: false });
+    if (invitationsError) console.warn("No se pudieron cargar las invitaciones", invitationsError);
+    else workspaceInvitations = invitations || [];
+  }
+  usersReady = true;
 }
 
 async function loadSessionHistory() {
@@ -243,8 +289,12 @@ async function initializeAuth() {
   await loadAuthProviderSettings();
   const { data } = await window.pulseplaySupabase.auth.getSession();
   await loadSupabaseAdmin(data.session?.user || null);
+  const returnedFromInvite = window.pulseplayAuthReturn?.type === "invite";
   const returnedFromConfirmation = window.pulseplayAuthReturn?.confirmed || window.pulseplayAuthReturn?.type === "signup";
-  if (data.session && returnedFromConfirmation) {
+  if (data.session && returnedFromInvite) {
+    authReady = true;
+    navigate("/reset-password");
+  } else if (data.session && returnedFromConfirmation) {
     authReady = true;
     navigate("/confirmed");
   }
@@ -253,7 +303,7 @@ async function initializeAuth() {
       await loadSupabaseAdmin(session?.user || null);
       authReady = true;
       const currentRoute = location.hash.replace("#", "") || "/";
-      if (event === "PASSWORD_RECOVERY") navigate("/reset-password");
+      if (event === "PASSWORD_RECOVERY" || (session && window.pulseplayAuthReturn?.type === "invite")) navigate("/reset-password");
       else if (session && (window.pulseplayAuthReturn?.confirmed || window.pulseplayAuthReturn?.type === "signup")) navigate("/confirmed");
       else if (session && (["/login", "/register"].includes(currentRoute) || currentRoute.includes("access_token="))) navigate("/dashboard");
       render();
@@ -517,8 +567,15 @@ function activityRowsMarkup(activities) {
 
 function usersView() {
   const admin = getAdmin();
-  const users = getUsers().filter(user => user.workspaceId === admin.workspaceId);
-  return adminShell(`<div class="admin-heading"><div><div class="eyebrow">Equipo</div><h1>Gestión de usuarios</h1><p class="muted">Administradores que pueden crear o presentar actividades.</p></div><button class="btn" id="toggle-user-form">+ Invitar usuario</button></div><form id="user-form" class="panel inline-form hidden"><div class="field"><label>Nombre</label><input name="name" required /></div><div class="field"><label>Correo</label><input name="email" type="email" required /></div><div class="field"><label>Contraseña temporal</label><input name="password" minlength="6" required /></div><div class="field"><label>Rol</label><select name="role"><option value="editor">Editor</option><option value="owner">Propietario</option></select></div><button class="btn">Crear usuario</button></form><div class="panel users-table"><div class="table-row table-head"><span>Usuario</span><span>Rol</span><span>Estado</span><span></span></div>${users.map(user => `<div class="table-row"><span class="user-cell"><b class="avatar small">${escapeHtml(user.name[0])}</b><span><strong>${escapeHtml(user.name)}</strong><small>${escapeHtml(user.email)}</small></span></span><span>${user.role === "owner" ? "Propietario" : "Editor"}</span><span class="online-label">Activo</span><span>${user.id !== getAdmin()?.id ? `<button class="icon-btn delete-user" data-id="${user.id}" title="Eliminar">×</button>` : "Tú"}</span></div>`).join("")}</div>`, "users");
+  const isSupabase = Boolean(window.pulseplaySupabase);
+  const isOwner = admin.role === "owner";
+  const users = isSupabase ? workspaceUsers : getUsers().filter(user => user.workspaceId === admin.workspaceId);
+  const invitationRows = workspaceInvitations.map(invitation => `<div class="table-row pending-user"><span class="user-cell"><b class="avatar small">${escapeHtml(invitation.email[0].toUpperCase())}</b><span><strong>${escapeHtml(invitation.email)}</strong><small>Invitación enviada</small></span></span><span>${invitation.role === "owner" ? "Propietario" : "Editor"}</span><span class="pending-label">Pendiente</span><span><button class="icon-btn revoke-invitation" data-id="${invitation.id}" title="Revocar invitación">×</button></span></div>`).join("");
+  const memberRows = users.map(user => `<div class="table-row"><span class="user-cell"><b class="avatar small">${escapeHtml((user.name || user.email || "?")[0].toUpperCase())}</b><span><strong>${escapeHtml(user.name)}</strong><small>${escapeHtml(user.email)}</small></span></span><span>${isOwner && user.id !== admin.id ? `<select class="member-role" data-id="${user.id}"><option value="editor" ${user.role === "editor" ? "selected" : ""}>Editor</option><option value="owner" ${user.role === "owner" ? "selected" : ""}>Propietario</option></select>` : user.role === "owner" ? "Propietario" : "Editor"}</span><span class="online-label">Activo</span><span>${user.id !== admin.id && isOwner ? `<button class="icon-btn delete-user" data-id="${user.id}" title="Quitar del equipo">×</button>` : "Tú"}</span></div>`).join("");
+  const inviteButton = isOwner ? `<button class="btn" id="toggle-user-form">+ Invitar usuario</button>` : "";
+  const inviteForm = isOwner ? `<form id="user-form" class="panel inline-form team-invite-form hidden"><div class="field"><label>Correo</label><input name="email" type="email" placeholder="persona@empresa.cl" required /></div><div class="field"><label>Rol</label><select name="role"><option value="editor">Editor</option><option value="owner">Propietario</option></select></div><button class="btn">Enviar invitación</button><p class="form-help">La persona recibirá un correo y definirá su propia contraseña.</p></form>` : `<div class="panel permission-note">Puedes ver el equipo, pero sólo un propietario puede administrarlo.</div>`;
+  const loading = isSupabase && !usersReady ? `<div class="panel results-empty"><strong>Cargando equipo...</strong></div>` : `<div class="panel users-table"><div class="table-row table-head"><span>Usuario</span><span>Rol</span><span>Estado</span><span></span></div>${memberRows}${invitationRows || ""}</div>`;
+  return adminShell(`<div class="admin-heading"><div><div class="eyebrow">Equipo</div><h1>Gestión de usuarios</h1><p class="muted">Personas que pueden crear o presentar actividades en este espacio.</p></div>${inviteButton}</div>${inviteForm}${loading}`, "users");
 }
 
 function profileView() {
@@ -881,8 +938,51 @@ function bindEvents() {
   document.querySelector("#page-prev")?.addEventListener("click", () => { libraryState.page -= 1; refreshLibraryResults(); });
   document.querySelector("#page-next")?.addEventListener("click", () => { libraryState.page += 1; refreshLibraryResults(); });
   document.querySelector("#toggle-user-form")?.addEventListener("click", () => document.querySelector("#user-form").classList.toggle("hidden"));
-  document.querySelector("#user-form")?.addEventListener("submit", event => { event.preventDefault(); const data = new FormData(event.currentTarget); const email = String(data.get("email")).trim().toLowerCase(); if (getUsers().some(user => user.email.toLowerCase() === email)) return showToast("Ese correo ya está registrado"); const admin = getAdmin(); const users = getUsers(); users.push({ id: crypto.randomUUID(), workspaceId: admin.workspaceId, name: String(data.get("name")).trim(), email, password: String(data.get("password")), role: String(data.get("role")), invitedBy: admin.id, createdAt: Date.now() }); saveUsers(users); render(); showToast("Usuario creado"); });
-  document.querySelectorAll(".delete-user").forEach(button => button.addEventListener("click", () => { saveUsers(getUsers().filter(user => user.id !== button.dataset.id)); render(); showToast("Usuario eliminado"); }));
+  document.querySelector("#user-form")?.addEventListener("submit", async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const email = String(data.get("email")).trim().toLowerCase();
+    const role = String(data.get("role"));
+    const submit = form.querySelector("button[type='submit'], button:not([type])");
+    submit.disabled = true;
+    try {
+      const { data: result, error } = await window.pulseplaySupabase.functions.invoke("invite-workspace-member", {
+        body: { email, role, workspaceId: getAdmin().workspaceId },
+      });
+      if (error) throw error;
+      if (result?.error) throw new Error(result.error);
+      await loadWorkspaceUsers();
+      render();
+      showToast(result?.message || "Invitación enviada");
+    } catch (error) {
+      showToast(error.message || "No se pudo enviar la invitación");
+      submit.disabled = false;
+    }
+  });
+  document.querySelectorAll(".member-role").forEach(select => select.addEventListener("change", async () => {
+    const { error } = await window.pulseplaySupabase.from("workspace_members").update({ role: select.value }).eq("workspace_id", getAdmin().workspaceId).eq("user_id", select.dataset.id);
+    if (error) return showToast(error.message);
+    await loadWorkspaceUsers();
+    render();
+    showToast("Rol actualizado");
+  }));
+  document.querySelectorAll(".delete-user").forEach(button => button.addEventListener("click", async () => {
+    const user = workspaceUsers.find(item => item.id === button.dataset.id);
+    if (!window.confirm(`¿Quitar a ${user?.name || "este usuario"} del equipo?`)) return;
+    const { error } = await window.pulseplaySupabase.from("workspace_members").delete().eq("workspace_id", getAdmin().workspaceId).eq("user_id", button.dataset.id);
+    if (error) return showToast(error.message);
+    await loadWorkspaceUsers();
+    render();
+    showToast("Usuario quitado del equipo");
+  }));
+  document.querySelectorAll(".revoke-invitation").forEach(button => button.addEventListener("click", async () => {
+    const { error } = await window.pulseplaySupabase.from("workspace_invitations").delete().eq("id", button.dataset.id);
+    if (error) return showToast(error.message);
+    await loadWorkspaceUsers();
+    render();
+    showToast("Invitación revocada");
+  }));
   document.querySelector("#profile-form")?.addEventListener("submit", async event => {
     event.preventDefault();
     const name = String(new FormData(event.currentTarget).get("name")).trim();

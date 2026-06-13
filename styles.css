@@ -126,6 +126,9 @@ button { cursor: pointer; }
 
 .inline-form { display: grid; grid-template-columns: repeat(4, 1fr) auto; gap: 12px; align-items: end; margin-bottom: 18px; }
 .inline-form .field { margin: 0; }
+.team-invite-form { grid-template-columns: minmax(260px, 2fr) minmax(160px, .7fr) auto; }
+.team-invite-form .form-help { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: .86rem; }
+.permission-note { margin-bottom: 18px; color: var(--muted); }
 .hidden { display: none !important; }
 .field select, .question-footer select { border: 1px solid var(--line); border-radius: 12px; padding: 12px; color: white; background: #111420; }
 .users-table { padding: 10px 22px; }
@@ -134,6 +137,9 @@ button { cursor: pointer; }
 .table-head { min-height: 45px; color: var(--muted); font-size: 13px; }
 .user-cell { display: flex; align-items: center; gap: 11px; }
 .online-label { color: var(--lime); }
+.pending-label { color: #f7c873; }
+.pending-user { opacity: .82; }
+.member-role { min-width: 130px; }
 .profile-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(280px, .8fr); gap: 18px; }
 .profile-card h2, .account-summary h3 { margin: 0; font: 700 24px "Space Grotesk"; }
 .profile-hero { display: flex; align-items: center; gap: 15px; margin-bottom: 22px; }
