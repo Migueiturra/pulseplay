@@ -126,7 +126,7 @@ button { cursor: pointer; }
 
 .inline-form { display: grid; grid-template-columns: repeat(4, 1fr) auto; gap: 12px; align-items: end; margin-bottom: 18px; }
 .inline-form .field { margin: 0; }
-.team-invite-form { grid-template-columns: minmax(260px, 2fr) minmax(160px, .7fr) auto; }
+.team-invite-form { grid-template-columns: minmax(260px, 2fr) auto; }
 .team-invite-form .form-help { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: .86rem; }
 .permission-note { margin-bottom: 18px; color: var(--muted); }
 .hidden { display: none !important; }
@@ -140,6 +140,12 @@ button { cursor: pointer; }
 .pending-label { color: #f7c873; }
 .pending-user { opacity: .82; }
 .member-role { min-width: 130px; }
+.platform-users-table { padding: 10px 22px; overflow-x: auto; }
+.platform-user-row { display: grid; grid-template-columns: minmax(220px, 1.6fr) 150px 100px 110px 120px 190px; gap: 14px; align-items: center; min-width: 980px; min-height: 68px; border-bottom: 1px solid var(--line); }
+.platform-user-row:last-child { border-bottom: 0; }
+.platform-user-actions { display: flex; align-items: center; gap: 8px; }
+.platform-user-actions .btn { min-height: 38px; padding: 8px 12px; }
+.suspended-label { color: #ff91a4; }
 .profile-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(280px, .8fr); gap: 18px; }
 .profile-card h2, .account-summary h3 { margin: 0; font: 700 24px "Space Grotesk"; }
 .profile-hero { display: flex; align-items: center; gap: 15px; margin-bottom: 22px; }

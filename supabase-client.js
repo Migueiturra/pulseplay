@@ -5,6 +5,8 @@ const initialAuthQuery = new URLSearchParams(location.search);
 window.pulseplayAuthReturn = {
   type: initialAuthHash.get("type"),
   confirmed: initialAuthQuery.get("confirmed") === "1",
+  invited: initialAuthQuery.get("invite") === "1",
+  oauth: initialAuthQuery.has("code") && !initialAuthQuery.has("confirmed") && !initialAuthQuery.has("invite"),
 };
 window.supabaseConfigurationError = hasSupabaseConfig && !window.supabase
   ? "No se pudo cargar el cliente de Supabase"

@@ -30,17 +30,17 @@ Deno.serve(async (request) => {
     const body = await request.json();
     const workspaceId = String(body.workspaceId || "");
     const email = String(body.email || "").trim().toLowerCase();
-    const role = body.role === "owner" ? "owner" : "editor";
+    const role = "editor";
     if (!workspaceId || !email.includes("@")) return json({ error: "Correo o espacio inválido" }, 400);
     if (email === authData.user.email?.toLowerCase()) return json({ error: "Ya perteneces a este equipo" }, 400);
 
-    const { data: ownerMembership } = await admin
+    const { data: membership } = await admin
       .from("workspace_members")
       .select("role")
       .eq("workspace_id", workspaceId)
       .eq("user_id", authData.user.id)
       .maybeSingle();
-    if (ownerMembership?.role !== "owner") return json({ error: "Sólo un propietario puede invitar usuarios" }, 403);
+    if (!membership) return json({ error: "No perteneces a este espacio" }, 403);
 
     const { error: invitationError } = await admin.from("workspace_invitations").upsert({
       workspace_id: workspaceId,
@@ -72,7 +72,8 @@ Deno.serve(async (request) => {
       return json({ status: "added", message: "El usuario fue agregado al equipo" });
     }
 
-    const redirectTo = Deno.env.get("PUBLIC_APP_URL") || "https://migueiturra.github.io/pulseplay/";
+    const publicUrl = Deno.env.get("PUBLIC_APP_URL") || "https://migueiturra.github.io/pulseplay/";
+    const redirectTo = `${publicUrl}${publicUrl.includes("?") ? "&" : "?"}invite=1`;
     const { error: inviteError } = await admin.auth.admin.inviteUserByEmail(email, {
       redirectTo,
       data: {
