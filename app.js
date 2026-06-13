@@ -20,6 +20,7 @@ let timerHandle = null;
 let toastHandle = null;
 let editorDirty = false;
 let libraryState = { query: "", sort: "recent", page: 1, pageSize: 10 };
+let resultsState = { query: "", sort: "recent", status: "all", page: 1, pageSize: 10 };
 let localPlayer = readJson(sessionStorage.getItem("pulseplay-player"), null);
 let supabaseAdmin = null;
 let authReady = false;
@@ -433,14 +434,39 @@ function sessionStatusLabel(status) {
 
 function resultsView() {
   if (!historyReady) return adminShell(`<section class="panel results-empty"><h2>Cargando resultados...</h2></section>`, "results");
-  const rows = sessionHistory.map(session => `<article class="history-row">
+  return adminShell(`<div class="admin-heading"><div><div class="eyebrow">Historial</div><h1>Resultados</h1><p class="muted">Revisa la participación y las respuestas de tus sesiones anteriores.</p></div><button class="btn secondary" id="refresh-results">Actualizar</button></div><div class="results-toolbar"><label class="library-search"><span>⌕</span><input id="results-search" value="${escapeAttr(resultsState.query)}" placeholder="Buscar por actividad o código de sala…" /></label><label class="sort-control"><span>Estado</span><select id="results-status"><option value="all" ${resultsState.status === "all" ? "selected" : ""}>Todos</option><option value="finished" ${resultsState.status === "finished" ? "selected" : ""}>Finalizadas</option><option value="active" ${resultsState.status === "active" ? "selected" : ""}>En curso</option></select></label><label class="sort-control"><span>Ordenar por</span><select id="results-sort"><option value="recent" ${resultsState.sort === "recent" ? "selected" : ""}>Más recientes primero</option><option value="oldest" ${resultsState.sort === "oldest" ? "selected" : ""}>Más antiguas primero</option><option value="participants" ${resultsState.sort === "participants" ? "selected" : ""}>Más participantes</option><option value="responses" ${resultsState.sort === "responses" ? "selected" : ""}>Más respuestas</option><option value="name" ${resultsState.sort === "name" ? "selected" : ""}>Actividad A–Z</option></select></label></div><div id="results-list">${resultsListMarkup()}</div>`, "results");
+}
+
+function resultsListMarkup() {
+  const query = resultsState.query.trim().toLowerCase();
+  const filtered = sessionHistory.filter(session => {
+    const matchesQuery = `${sessionActivityTitle(session)} ${session.code}`.toLowerCase().includes(query);
+    const matchesStatus = resultsState.status === "all" || (resultsState.status === "finished" ? session.status === "finished" : session.status !== "finished");
+    return matchesQuery && matchesStatus;
+  });
+  filtered.sort((a, b) => resultsState.sort === "oldest"
+    ? new Date(a.created_at) - new Date(b.created_at)
+    : resultsState.sort === "participants"
+      ? b.participants.length - a.participants.length
+      : resultsState.sort === "responses"
+        ? b.responses.length - a.responses.length
+        : resultsState.sort === "name"
+          ? sessionActivityTitle(a).localeCompare(sessionActivityTitle(b), "es")
+          : new Date(b.created_at) - new Date(a.created_at));
+  const totalPages = Math.max(1, Math.ceil(filtered.length / resultsState.pageSize));
+  resultsState.page = Math.min(resultsState.page, totalPages);
+  const start = (resultsState.page - 1) * resultsState.pageSize;
+  const pageItems = filtered.slice(start, start + resultsState.pageSize);
+  const rows = pageItems.map(session => `<article class="history-row">
     <div><strong>${escapeHtml(sessionActivityTitle(session))}</strong><small>Sala ${escapeHtml(session.code)} · ${formatDate(new Date(session.created_at).getTime())}</small></div>
     <span class="activity-status">${sessionStatusLabel(session.status)}</span>
     <span><b>${session.participants.length}</b> participantes</span>
     <span><b>${session.responses.length}</b> respuestas</span>
     <button class="btn secondary" data-nav="/results/${session.id}">Ver detalle</button>
   </article>`).join("");
-  return adminShell(`<div class="admin-heading"><div><div class="eyebrow">Historial</div><h1>Resultados</h1><p class="muted">Revisa la participación y las respuestas de tus sesiones anteriores.</p></div><button class="btn secondary" id="refresh-results">Actualizar</button></div><section class="panel history-list">${rows || `<div class="results-empty"><strong>Aún no hay sesiones registradas</strong><span class="muted">Cuando presentes una actividad, sus respuestas aparecerán aquí.</span></div>`}</section>`, "results");
+  const from = filtered.length ? start + 1 : 0;
+  const to = Math.min(start + resultsState.pageSize, filtered.length);
+  return `<section class="panel history-list">${rows || `<div class="results-empty"><strong>No encontramos resultados</strong><span class="muted">Prueba con otros filtros o presenta una actividad.</span></div>`}</section><div class="pagination-bar"><span>Mostrando ${from}–${to} de ${filtered.length}</span><label>Filas por página <select id="results-page-size"><option value="10" ${resultsState.pageSize === 10 ? "selected" : ""}>10</option><option value="25" ${resultsState.pageSize === 25 ? "selected" : ""}>25</option><option value="50" ${resultsState.pageSize === 50 ? "selected" : ""}>50</option></select></label><div class="page-controls"><button id="results-prev" ${resultsState.page === 1 ? "disabled" : ""}>←</button><strong>Página ${resultsState.page} de ${totalPages}</strong><button id="results-next" ${resultsState.page === totalPages ? "disabled" : ""}>→</button></div></div>`;
 }
 
 function responseValue(response, question) {
@@ -569,8 +595,12 @@ function presenterView(room) {
   else if (current?.type === "wordcloud") stage = `<section class="panel stage-card waiting">${timerMarkup(room, current)}<div class="question-count">Pregunta ${room.index + 1} de ${questions.length}</div><h1 class="question-title">${escapeHtml(current.title)}</h1><div class="cloud">${cloudMarkup(room.words) || `<span class="muted cloud-placeholder">Esperando palabras…</span>`}</div></section>`;
   else if (current) { const counts = current.options.map((_, option) => questionAnswers.filter(([, value]) => value.option === option).length); stage = `<section class="panel stage-card">${timerMarkup(room, current)}<div class="question-count">Pregunta ${room.index + 1} de ${questions.length}</div><h1 class="question-title">${escapeHtml(current.title)}</h1><div class="answers">${current.options.map((option, i) => `<div class="answer ${room.reveal && current.type === "quiz" && i === current.correct ? "correct" : ""}"><span class="letter">${"ABCD"[i]}</span><strong class="flex-grow">${escapeHtml(option)}</strong>${room.reveal ? `<b>${counts[i]}</b>` : ""}</div>`).join("")}</div></section>`; }
   else stage = `<section class="panel stage-card waiting"><h1>Agrega preguntas antes de presentar</h1><button class="btn" data-nav="/editor/${activity?.id}">Abrir editor</button></section>`;
-  const primaryLabel = room.status === "lobby" ? "Comenzar actividad" : room.status === "question" ? "Cerrar respuestas" : room.status === "results" ? "Ver clasificación" : room.status === "leaderboard" ? (room.index === questions.length - 1 ? "Finalizar actividad" : "Siguiente pregunta") : "Reiniciar demo";
-  return shell(`<main class="room"><div class="room-head"><div><div class="eyebrow">Panel del presentador</div><strong>${escapeHtml(activity?.title || room.activityTitle || "Actividad")}</strong></div><div class="room-code"><span class="status-dot"></span>Sala <strong>${room.code}</strong></div></div><div class="presenter-grid"><div>${stage}</div><aside class="panel control-panel"><h3>Control en vivo</h3><div class="metric"><span class="muted">Participantes</span><strong>${room.participants.length}</strong></div><div class="metric"><span class="muted">Respuestas</span><strong>${current?.type === "wordcloud" ? room.words.length : questionAnswers.length}</strong></div><div class="participant-control"><span class="control-label">En la sala</span>${room.participants.length ? room.participants.map(player => `<div class="participant-row"><span>${escapeHtml(player.name)}</span><button class="kick-player" data-id="${player.id}" title="Expulsar">×</button></div>`).join("") : `<small class="muted">Sin participantes</small>`}</div><div class="steps">${questions.map((q, i) => `<div class="step ${room.status !== "lobby" && i === room.index ? "active" : ""}">${i + 1}. ${typeLabel(q.type)}</div>`).join("")}<div class="step ${["leaderboard", "finished"].includes(room.status) ? "active" : ""}">★ Leaderboard</div></div><button id="admin-next" class="btn purple" ${questions.length ? "" : "disabled"}>${primaryLabel}</button><button id="reset-room" class="btn secondary">Vaciar sala</button><button class="admin-link" data-nav="/dashboard">Volver al estudio</button></aside></div></main>`, getAdmin() ? `<button class="admin-link" id="admin-logout">Cerrar sesión</button>` : `<button class="admin-link" data-nav="/login">Administrar</button>`);
+  const isFinalLeaderboard = room.status === "finished" || (room.status === "leaderboard" && room.index === questions.length - 1);
+  const primaryLabel = room.status === "lobby" ? "Comenzar actividad" : room.status === "question" ? "Cerrar respuestas" : room.status === "results" ? "Ver clasificación" : "Siguiente pregunta";
+  const controls = isFinalLeaderboard
+    ? `<div class="final-session-actions"><button id="finish-and-results" class="btn purple">Finalizar y ver resultados</button><button id="present-again" class="btn secondary">Presentar nuevamente</button><button class="admin-link" data-nav="/dashboard">Volver al estudio</button></div>`
+    : `<button id="admin-next" class="btn purple" ${questions.length ? "" : "disabled"}>${primaryLabel}</button><button class="admin-link" data-nav="/dashboard">Volver al estudio</button>`;
+  return shell(`<main class="room"><div class="room-head"><div><div class="eyebrow">Panel del presentador</div><strong>${escapeHtml(activity?.title || room.activityTitle || "Actividad")}</strong></div><div class="room-code"><span class="status-dot"></span>Sala <strong>${room.code}</strong></div></div><div class="presenter-grid"><div>${stage}</div><aside class="panel control-panel"><h3>Control en vivo</h3><div class="metric"><span class="muted">Participantes</span><strong>${room.participants.length}</strong></div><div class="metric"><span class="muted">Respuestas</span><strong>${current?.type === "wordcloud" ? room.words.length : questionAnswers.length}</strong></div><div class="participant-control"><span class="control-label">En la sala</span>${room.participants.length ? room.participants.map(player => `<div class="participant-row"><span>${escapeHtml(player.name)}</span><button class="kick-player" data-id="${player.id}" title="Expulsar">×</button></div>`).join("") : `<small class="muted">Sin participantes</small>`}</div><div class="steps">${questions.map((q, i) => `<div class="step ${room.status !== "lobby" && i === room.index ? "active" : ""}">${i + 1}. ${typeLabel(q.type)}</div>`).join("")}<div class="step ${["leaderboard", "finished"].includes(room.status) ? "active" : ""}">★ Leaderboard</div></div>${controls}</aside></div></main>`, getAdmin() ? `<button class="admin-link" id="admin-logout">Cerrar sesión</button>` : `<button class="admin-link" data-nav="/login">Administrar</button>`);
 }
 
 function participantResultsMarkup(room, current, submitted) {
@@ -871,6 +901,10 @@ function bindEvents() {
     try { await loadSessionHistory(); render(); showToast("Resultados actualizados"); }
     catch (error) { showToast(error.message || "No se pudieron actualizar los resultados"); }
   });
+  document.querySelector("#results-search")?.addEventListener("input", event => { resultsState.query = event.target.value; resultsState.page = 1; refreshResultsList(); });
+  document.querySelector("#results-sort")?.addEventListener("change", event => { resultsState.sort = event.target.value; resultsState.page = 1; refreshResultsList(); });
+  document.querySelector("#results-status")?.addEventListener("change", event => { resultsState.status = event.target.value; resultsState.page = 1; refreshResultsList(); });
+  bindResultsPaginationEvents();
   const activityForm = document.querySelector("#activity-form");
   activityForm?.addEventListener("input", () => { editorDirty = true; updateSaveState(); });
   activityForm?.addEventListener("change", () => { editorDirty = true; updateSaveState(); });
@@ -939,16 +973,35 @@ function bindEvents() {
     if (room.status === "finished") { const activityId = room.activityId; Object.assign(room, roomForActivity(activityId)); }
     });
   });
-  document.querySelector("#reset-room")?.addEventListener("click", async () => {
-    const activityId = getRoom().activityId;
-    if (getRoom().id && window.pulseplaySupabase) {
-      try { await createLiveSession(activityId); showToast("Sala reiniciada con un código nuevo"); }
-      catch (error) { showToast(error.message); }
-      return;
-    }
-    saveRoom(roomForActivity(activityId));
-    showToast("Sala reiniciada con un código nuevo");
+  document.querySelector("#finish-and-results")?.addEventListener("click", async () => {
+    const liveRoom = getRoom();
+    const sessionId = liveRoom.id;
+    try {
+      if (sessionId && window.pulseplaySupabase && liveRoom.status !== "finished") await controlLiveSession("finish");
+      else if (!sessionId) mutateRoom(room => { room.status = "finished"; room.endsAt = null; });
+      await loadSessionHistory();
+      navigate(sessionId ? `/results/${sessionId}` : "/results");
+    } catch (error) { showToast(error.message || "No se pudo finalizar la actividad"); }
   });
+  document.querySelector("#present-again")?.addEventListener("click", async () => {
+    const activityId = getRoom().activityId;
+    try { await createLiveSession(activityId); showToast("Nueva sala creada"); }
+    catch (error) { showToast(error.message || "No se pudo crear otra sala"); }
+  });
+}
+
+function refreshResultsList() {
+  const container = document.querySelector("#results-list");
+  if (!container) return;
+  container.innerHTML = resultsListMarkup();
+  bindResultsPaginationEvents();
+  document.querySelectorAll("#results-list [data-nav]").forEach(el => el.addEventListener("click", () => navigateSafely(el.dataset.nav)));
+}
+
+function bindResultsPaginationEvents() {
+  document.querySelector("#results-page-size")?.addEventListener("change", event => { resultsState.pageSize = Number(event.target.value); resultsState.page = 1; refreshResultsList(); });
+  document.querySelector("#results-prev")?.addEventListener("click", () => { resultsState.page -= 1; refreshResultsList(); });
+  document.querySelector("#results-next")?.addEventListener("click", () => { resultsState.page += 1; refreshResultsList(); });
 }
 
 function refreshLibraryResults() {
