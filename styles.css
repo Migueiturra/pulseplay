@@ -64,6 +64,7 @@ button { cursor: pointer; }
 .google-auth { width: 100%; display: grid; grid-template-columns: 32px 1fr; align-items: center; gap: 10px; margin-top: 20px; padding: 11px 14px; border: 1px solid var(--line); border-radius: 14px; color: white; background: #171a29; text-align: left; }
 .google-auth > span { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; color: #316ff6; background: white; font-weight: 800; }
 .google-auth small { grid-column: 2; margin-top: -8px; color: var(--muted); }
+.google-auth.provider-disabled { opacity: .65; cursor: not-allowed; }
 .auth-divider { display: flex; align-items: center; gap: 12px; margin: 20px 0 4px; color: var(--muted); font-size: 12px; }
 .auth-divider::before, .auth-divider::after { content: ""; height: 1px; flex: 1; background: var(--line); }
 .auth-form-links { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 16px; color: var(--muted); font-size: 13px; }

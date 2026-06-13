@@ -28,6 +28,7 @@ let liveRoomCache = null;
 let liveSyncHandle = null;
 let sessionHistory = [];
 let historyReady = false;
+let authProviders = { email: true, google: false, ready: false };
 const LIVE_CODE_KEY = "pulseplay-live-code";
 const clientId = sessionStorage.getItem(CLIENT_KEY) || crypto.randomUUID();
 sessionStorage.setItem(CLIENT_KEY, clientId);
@@ -55,6 +56,26 @@ function authRedirect(path = "") {
   const configured = window.PULSEPLAY_CONFIG?.publicAppUrl || `${location.origin}${location.pathname}`;
   const base = configured.endsWith("/") ? configured : `${configured}/`;
   return `${base}${path.replace(/^\//, "")}`;
+}
+
+async function loadAuthProviderSettings() {
+  const config = window.PULSEPLAY_CONFIG;
+  if (!config?.supabaseUrl || !config?.supabaseAnonKey) return;
+  try {
+    const response = await fetch(`${config.supabaseUrl}/auth/v1/settings`, {
+      headers: { apikey: config.supabaseAnonKey },
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const settings = await response.json();
+    authProviders = {
+      email: settings.external?.email !== false,
+      google: settings.external?.google === true,
+      ready: true,
+    };
+  } catch (error) {
+    console.warn("No se pudo consultar la configuración de proveedores", error);
+    authProviders = { ...authProviders, ready: true };
+  }
 }
 
 async function loadSupabaseAdmin(user) {
@@ -218,6 +239,7 @@ async function initializeAuth() {
     return;
   }
 
+  await loadAuthProviderSettings();
   const { data } = await window.pulseplaySupabase.auth.getSession();
   await loadSupabaseAdmin(data.session?.user || null);
   const returnedFromConfirmation = window.pulseplayAuthReturn?.confirmed || window.pulseplayAuthReturn?.type === "signup";
@@ -374,10 +396,14 @@ function confirmedView() {
 
 function loginView() {
   if (getAdmin()) { navigate("/dashboard"); return ""; }
-  return shell(`<main class="auth-wrap"><section class="panel auth-card"><div class="eyebrow">Acceso administrador</div><h1>Bienvenido de vuelta</h1><p class="muted">Gestiona tus actividades y sesiones en vivo.</p>${googleAuthButton()}<div class="auth-divider"><span>o continúa con correo</span></div><form id="login-form"><div class="field"><label>Correo</label><input name="email" type="email" autocomplete="email" required /></div><div class="field"><label>Contraseña</label><input name="password" type="password" autocomplete="current-password" required /></div><div class="auth-form-links"><label><input type="checkbox" name="remember" checked /> Mantener sesión iniciada</label><button type="button" class="admin-link" data-nav="/forgot">¿Olvidaste tu contraseña?</button></div><button class="btn full">Iniciar sesión</button></form><p class="auth-switch">¿No tienes una cuenta? <button class="admin-link" data-nav="/register">Crear cuenta</button></p><div class="demo-note"><strong>Cuenta de demostración</strong><span>admin@pulseplay.local · demo123</span></div></section></main>`, `<button class="admin-link" data-nav="/">Volver</button>`);
+  return shell(`<main class="auth-wrap"><section class="panel auth-card"><div class="eyebrow">Acceso administrador</div><h1>Bienvenido de vuelta</h1><p class="muted">Gestiona tus actividades y sesiones en vivo.</p>${googleAuthButton()}<div class="auth-divider"><span>o continúa con correo</span></div><form id="login-form"><div class="field"><label>Correo</label><input name="email" type="email" autocomplete="email" required /></div><div class="field"><label>Contraseña</label><input name="password" type="password" autocomplete="current-password" required /></div><div class="auth-form-links"><label><input type="checkbox" name="remember" checked /> Mantener sesión iniciada</label><button type="button" class="admin-link" data-nav="/forgot">¿Olvidaste tu contraseña?</button></div><button class="btn full">Iniciar sesión</button></form><p class="auth-switch">¿No tienes una cuenta? <button class="admin-link" data-nav="/register">Crear cuenta</button></p></section></main>`, `<button class="admin-link" data-nav="/">Volver</button>`);
 }
 
-function googleAuthButton() { return `<button class="google-auth" type="button" id="google-auth"><span>G</span>Continuar con Google<small>${window.isSupabaseConfigured?.() ? "Acceso seguro con tu cuenta" : "Disponible al agregar la clave pública"}</small></button>`; }
+function googleAuthButton() {
+  if (!window.isSupabaseConfigured?.()) return "";
+  const enabled = authProviders.google;
+  return `<button class="google-auth ${enabled ? "" : "provider-disabled"}" type="button" id="google-auth" ${enabled ? "" : "disabled"}><span>G</span>${enabled ? "Continuar con Google" : "Google aún no disponible"}<small>${enabled ? "Inicia sesión o crea tu cuenta" : "El proveedor debe activarse en Supabase"}</small></button>`;
+}
 
 function registerView() {
   if (getAdmin()) { navigate("/dashboard"); return ""; }
@@ -684,6 +710,7 @@ function bindEvents() {
     navigate("/");
   }));
   document.querySelector("#google-auth")?.addEventListener("click", async () => {
+    if (!authProviders.google) return showToast("Google todavía no está habilitado en Supabase");
     if (!window.pulseplaySupabase) return showToast("Falta agregar la clave pública de Supabase");
     const { error } = await window.pulseplaySupabase.auth.signInWithOAuth({
       provider: "google",
